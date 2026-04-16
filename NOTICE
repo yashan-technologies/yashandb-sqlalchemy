@@ -1,0 +1,19 @@
+yashandb-sqlalchemy / yashandb_sqlalchemy
+
+This project is released under the Mulan Permissive Software License, Version 2
+(Mulan PSL v2). See the file "LICENSE" in the repository root.
+
+Third-party notices
+-------------------
+
+This project contains and/or is derived from portions of SQLAlchemy, an open
+source project by the SQLAlchemy authors and contributors, which is licensed
+under the MIT License.
+
+The upstream SQLAlchemy license and attribution notices are retained in source
+file headers where applicable. For details about SQLAlchemy, see:
+  - https://www.sqlalchemy.org/
+  - https://github.com/sqlalchemy/sqlalchemy
+
+If you redistribute this project (in source or binary form), you must also
+comply with all applicable third-party license and attribution requirements.

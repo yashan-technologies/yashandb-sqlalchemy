@@ -1,6 +1,6 @@
-# from sqlalchemy.testing.suite import *
-# from sqlalchemy.testing.suite.test_ddl import *
-# from sqlalchemy.testing.suite.test_select import *
+from sqlalchemy.testing.suite import *
+from sqlalchemy.testing.suite.test_ddl import *
+from sqlalchemy.testing.suite.test_select import *
 from sqlalchemy.testing.suite.test_insert import *
 
 
@@ -24,7 +24,7 @@ from sqlalchemy import literal_column
 
 
 def Column(*args, **kw):
-    """A schema.Column wrapper/hook for yasdb-specific tweaks."""
+    """A schema.Column wrapper/hook for yashandb-specific tweaks."""
 
     test_opts = {k: kw.pop(k) for k in list(kw) if k.startswith("test_")}
 
