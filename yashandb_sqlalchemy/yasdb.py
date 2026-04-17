@@ -1,11 +1,8 @@
 # Copyright (C) 2005-2023 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
-# This project (yashandb-sqlalchemy/yashandb_sqlalchemy) is licensed under
-# Mulan PSL v2. See the repository root LICENSE file.
-#
-# This file contains and/or is derived from portions of SQLAlchemy, which is
-# licensed under the MIT License. Upstream attribution is retained. See NOTICE.
+# This module is part of SQLAlchemy and is released under
+# the MIT License: https://www.opensource.org/licenses/mit-license.php
 
 from __future__ import absolute_import
 
@@ -260,23 +257,11 @@ class YasExecutionContext_yasdb(YasExecutionContext):
                 for i in range(len(self.out_parameters))
             ]
 
-            def _returning_col_name(col, i):
-                name = getattr(col, "name", None)
-                if not name:
-                    name = (
-                        getattr(col, "_anon_name_label", None)
-                        or getattr(col, "_anon_name", None)
-                        or ("ret_%d" % i)
-                    )
-                return name
-
             fetch_strategy = _cursor.FullyBufferedCursorFetchStrategy(
                 self.cursor,
                 [
-                    (_returning_col_name(col, i), None)
-                    for i, col in enumerate(
-                        expression._select_iterables(self.compiled.returning)
-                    )
+                    (getattr(col, "name", col._anon_name_label), None)
+                    for col in expression._select_iterables(self.compiled.returning)
                 ],
                 initial_buffer=[tuple(returning_params)],
             )

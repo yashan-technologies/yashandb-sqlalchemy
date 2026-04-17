@@ -2,11 +2,8 @@
 # Copyright (C) 2005-2023 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
-# This project (yashandb-sqlalchemy/yashandb_sqlalchemy) is licensed under
-# Mulan PSL v2. See the repository root LICENSE file.
-#
-# This file contains and/or is derived from portions of SQLAlchemy, which is
-# licensed under the MIT License. Upstream attribution is retained. See NOTICE.
+# This module is part of SQLAlchemy and is released under
+# the MIT License: https://www.opensource.org/licenses/mit-license.php
 
 from . import base, yasdb, yaspy  # noqa
 from .base import BFILE
@@ -32,7 +29,7 @@ from .base import VARCHAR
 from .base import VARCHAR2
 
 # default dialect
-base.dialect = dialect = yaspy.dialect
+base.dialect = dialect = yasdb.dialect
 
 __all__ = (
     "VARCHAR",
