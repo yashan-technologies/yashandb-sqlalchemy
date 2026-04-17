@@ -1,0 +1,56 @@
+name: Build wheel and optional PyPI publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_to_pypi:
+        description: "构建完成后自动上传到 PyPI？（仅允许从 Tag 运行时上传）"
+        type: boolean
+        default: false
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout (fetch tags for version)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Upgrade tooling
+        run: |
+          python -m pip install -U pip setuptools wheel build twine
+
+      # 仅用于打印提示，方便你在日志里一眼看出当前 ref
+      - name: Show ref
+        run: |
+          echo "ref: $GITHUB_REF"
+          echo "ref_name: $GITHUB_REF_NAME"
+
+      - name: Build wheel
+        run: |
+          python -m build --wheel
+          ls -lah dist
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-dist
+          path: dist/*.whl
+
+      - name: Publish to PyPI (only when running from a tag)
+        if: ${{ github.event.inputs.publish_to_pypi == 'true' && startsWith(github.ref, 'refs/tags/') }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          twine upload --non-interactive dist/*.whl
