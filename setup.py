@@ -27,15 +27,14 @@ setup(
     author="CoD",
     author_email="cod@sics.ac.cn",
     url="https://www.yashandb.com/",
-    license="MulanPSL-2.0",
+    license="MIT",
     packages=["yashandb_sqlalchemy"],
     include_package_data=True,
     entry_points={
         "sqlalchemy.dialects": [
-            "yashandb = yashandb_sqlalchemy.yaspy:YasDialect_yaspy",
-            "yashandb.yaspy = yashandb_sqlalchemy.yaspy:YasDialect_yaspy",
+            "yashandb = yashandb_sqlalchemy.yasdb:YasDialect_yasdb",
             "yashandb.yasdb = yashandb_sqlalchemy.yasdb:YasDialect_yasdb",
+            "yashandb.yaspy = yashandb_sqlalchemy.yaspy:YasDialect_yaspy",
         ]
     },
-    
 )
