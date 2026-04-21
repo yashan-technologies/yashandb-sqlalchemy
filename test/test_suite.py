@@ -7,6 +7,10 @@ from sqlalchemy.testing.suite.test_insert import *
 from sqlalchemy.testing.suite import InsertBehaviorTest as _InsertBehaviorTest
 from sqlalchemy.testing.suite import LastrowidTest as _LastrowidTest
 from sqlalchemy.testing.suite import ReturningTest as _ReturningTest
+from sqlalchemy.testing.suite.test_select import ExistsTest as _SuiteExistsTest
+from sqlalchemy.testing.suite.test_select import PostCompileParamsTest as _SuitePostCompileParamsTest
+
+from sqlalchemy import testing
 
 from sqlalchemy.testing.schema import Column as _Column
 from sqlalchemy.testing.schema import Table
@@ -112,3 +116,23 @@ class ReturningTest(_ReturningTest):
             Column("id", Integer, primary_key=True, test_needs_autoincrement=True),
             Column("data", String(50)),
         )
+
+
+class DifficultParametersTest(DifficultParametersTest):
+    __requires__ = ("difficult_parameters",)
+
+
+class ExistsTest(_SuiteExistsTest):
+    @testing.requires.select_literal_binds
+    def test_select_exists(self, connection):
+        return super(ExistsTest, self).test_select_exists(connection)
+
+
+class PostCompileParamsTest(_SuitePostCompileParamsTest):
+    @testing.requires.assertsql_empty_parameters_tuple
+    def test_execute(self):
+        return super(PostCompileParamsTest, self).test_execute()
+
+    @testing.requires.assertsql_empty_parameters_tuple
+    def test_execute_expanding_plus_literal_execute(self):
+        return super(PostCompileParamsTest, self).test_execute_expanding_plus_literal_execute()

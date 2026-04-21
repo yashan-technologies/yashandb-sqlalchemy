@@ -18,106 +18,13 @@ from .base import YasCompiler
 from .base import YasDialect
 from .base import YasExecutionContext
 from sqlalchemy import exc
-from sqlalchemy import event
 from sqlalchemy import processors
 from sqlalchemy import types as sqltypes
 from sqlalchemy import util
 from sqlalchemy.engine import cursor as _cursor
-from sqlalchemy.engine import Engine
 from sqlalchemy.sql import expression
-from sqlalchemy.sql import operators
 from sqlalchemy.pool import SingletonThreadPool
 from sqlalchemy.util import compat
-
-
-_YASPY_EVENT_INSTALLED = False
-
-
-def _install_yaspy_parameter_coercion_events():
-    global _YASPY_EVENT_INSTALLED
-    if _YASPY_EVENT_INSTALLED:
-        return
-    _YASPY_EVENT_INSTALLED = True
-
-    @event.listens_for(Engine, "before_cursor_execute", retval=True)
-    def _yashandb_yaspy_before_cursor_execute(
-        conn, cursor, statement, parameters, context, executemany
-    ):
-        # Only apply to this dialect+driver.
-        d = getattr(conn, "dialect", None)
-        if d is None:
-            return statement, parameters
-        if getattr(d, "name", None) != "yashandb" or getattr(d, "driver", None) != "yaspy":
-            return statement, parameters
-        if parameters == []:
-            parameters = ()
-        return statement, parameters
-
-
-_install_yaspy_parameter_coercion_events()
-
-
-class _YaspyAssertSqlCursorWrapper(object):
-    """Wrap yaspy cursor so SQLAlchemy 1.4 assertsql sees canonical empty params.
-
-    SQLAlchemy's assertsql compares empty positional parameters as ``()``; some
-    execution paths pass ``[]`` down to DBAPI ``cursor.execute``.
-    """
-
-    __slots__ = ("_cursor",)
-
-    def __init__(self, cursor):
-        self._cursor = cursor
-
-    def execute(self, operation, parameters=None):
-        if parameters is None:
-            return self._cursor.execute(operation)
-        if parameters == []:
-            parameters = ()
-        return self._cursor.execute(operation, parameters)
-
-    def executemany(self, operation, seq_of_parameters):
-        return self._cursor.executemany(operation, seq_of_parameters)
-
-    def _coerce_row(self, row):
-        if row is None:
-            return None
-        # Keep this extremely conservative: only coerce single-column '0'/'1'
-        # results to ints. This addresses EXISTS/CASE expressions where the
-        # driver returns numeric strings.
-        if (
-            isinstance(row, (tuple, list))
-            and len(row) == 1
-            and isinstance(row[0], util.string_types)
-        ):
-            v = row[0].strip()
-            if v in ("0", "1"):
-                return (int(v),)
-        return row
-
-    def fetchone(self):
-        return self._coerce_row(self._cursor.fetchone())
-
-    def fetchmany(self, size=None):
-        rows = self._cursor.fetchmany(size) if size is not None else self._cursor.fetchmany()
-        if not rows:
-            return rows
-        return [self._coerce_row(r) for r in rows]
-
-    def fetchall(self):
-        rows = self._cursor.fetchall()
-        if not rows:
-            return rows
-        return [self._coerce_row(r) for r in rows]
-
-    def setinputsizes(self, *sizes, **kwargs):
-        fn = getattr(self._cursor, "setinputsizes", None)
-        if fn is None:
-            return
-        return fn(*sizes, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._cursor, name)
 
 
 class _YasInteger(sqltypes.Integer):
@@ -398,27 +305,6 @@ class YasCompiler_yaspy(YasCompiler):
     # yaspy has not this attr
     _yaspy_sql_compiler = True
 
-    def _compile_exists_as_numeric_scalar(self, element, **kw):
-        inner = self.process(element, **kw)
-        return "CAST(CASE WHEN EXISTS (%s) THEN 1 ELSE 0 END AS NUMBER(1,0))" % (
-            inner,
-        )
-
-    def visit_exists(self, exists, **kw):
-        # Some drivers return EXISTS scalar results as strings (e.g. '1').
-        # Force a numeric projection so SQLAlchemy's testing suite sees int 1/0.
-        return self._compile_exists_as_numeric_scalar(exists.element, **kw)
-
-    def visit_unary(self, unary, **kw):
-        # SQLAlchemy 1.4.x may represent EXISTS as a unary expression; ensure the
-        # SELECT-column EXISTS form is coerced consistently.
-        if (
-            unary.operator is operators.exists
-            and kw.get("within_columns_clause", False)
-        ):
-            return self._compile_exists_as_numeric_scalar(unary.element, **kw)
-        return super(YasCompiler_yaspy, self).visit_unary(unary, **kw)
-
     def visit_bindparam(self, bindparam, **kw):
         # In some constructs (notably CASE), SQLAlchemy may render a bindparam
         # of NullType even though it's being compared against a typed column.
@@ -531,37 +417,6 @@ class YasExecutionContext_yaspy(YasExecutionContext):
                 preParamValue = bindparam
 
     def pre_exec(self):
-        # SQLAlchemy 1.4 assertsql expects empty positional parameters as "()"
-        # when observing cursor execution. Normalize no-parameter executions to
-        # a single empty parameter set so that the engine passes () downstream.
-        if self.parameters in ([], ()):
-            self.parameters = [()]
-        elif len(self.parameters) == 1 and not self.parameters[0]:
-            # can be [[]], [()], [{}], ([],), ((),), etc.
-            self.parameters = [()]
-        if self.parameters == [()]:
-            # Force the engine into the "do_execute" path so that the
-            # after_cursor_execute event observes parameters as "()" rather
-            # than the internal "[]" placeholder used for no-parameter
-            # executions.
-            self.no_parameters = False
-
-        # Ensure NULL binds participating in typed comparisons carry an actual
-        # datatype. This is needed for expressions like:
-        #   CASE WHEN (:foo IS NOT NULL) THEN :foo ELSE date_table.date_data END
-        # where :foo is often NullType at compile time; YashanDB may raise
-        # "invalid datatype" when binding NULL without type information.
-        try:
-            binds = getattr(self.compiled, "binds", None)
-            if isinstance(binds, dict):
-                for bp in binds.values():
-                    if isinstance(getattr(bp, "type", None), sqltypes.NullType):
-                        ctt = getattr(bp, "_compared_to_type", None)
-                        if isinstance(ctt, (sqltypes.Date, sqltypes.DateTime, sqltypes.Time)):
-                            bp.type = ctt
-        except Exception:
-            pass
-
         if not getattr(self.compiled, "_yaspy_sql_compiler", False):
             return
 
@@ -607,7 +462,7 @@ class YasExecutionContext_yaspy(YasExecutionContext):
         if self.dialect.arraysize:
             c.arraysize = self.dialect.arraysize
 
-        return _YaspyAssertSqlCursorWrapper(c)
+        return c
 
     def get_out_parameter_values(self, out_param_names):
         # this method should not be called when the compiler has
@@ -666,150 +521,7 @@ class YasDialect_yaspy(YasDialect):
         yashandb.ROWID: _YasRowid,
     }
 
-    # SQLAlchemy 1.4.5 assertsql expects empty positional params as "()" rather
-    # than "[]". Using tuple format helps match that while still allowing the
-    # execution context to coerce rows to mutable lists for RETURNING/outparam
-    # injection.
-    execute_sequence_format = tuple
-
     def do_execute(self, cursor, statement, parameters, context=None):
-        # SQLAlchemy 1.4.5 assertsql expects empty positional params as "()"
-        # rather than "[]" when observing cursor execution.
-        if parameters == []:
-            parameters = ()
-
-        # DifficultParametersTest uses column names that include characters like
-        # "%", "/", ":" etc. When SQLAlchemy uses those names as bindparam keys,
-        # the rendered placeholders can become invalid for YashanDB (e.g.
-        # :%percent, :/slashes/, :1col:on, :more :: %colons%, :par(ens)).
-        #
-        # When parameters are positional (a sequence), we can safely rewrite
-        # these placeholders to simple names, keeping the parameter sequence
-        # unchanged.
-        try:
-            if isinstance(parameters, (list, tuple)) and parameters:
-                compiled = getattr(context, "compiled", None) if context is not None else None
-                pt = list(getattr(compiled, "positiontup", None) or ())
-
-                if pt:
-                    # positiontup contains the bind parameter keys in positional
-                    # order, even if they include spaces / punctuation.
-                    for idx, key in enumerate(pt):
-                        if not key:
-                            continue
-                        statement = re.sub(
-                            r":" + re.escape(key),
-                            f":p{idx}",
-                            statement,
-                        )
-                else:
-                    # Fallback: best-effort tokenization for common cases
-                    binds = []
-                    for m in re.finditer(r":([^\s,\)]+)", statement):
-                        name = m.group(1)
-                        if name not in binds:
-                            binds.append(name)
-                    invalid = [
-                        b
-                        for b in binds
-                        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", b)
-                    ]
-                    if invalid:
-                        mapping = {b: f"p{i}" for i, b in enumerate(binds)}
-                        for b in invalid:
-                            statement = re.sub(
-                                r":" + re.escape(b) + r"(?![A-Za-z0-9_])",
-                                ":" + mapping[b],
-                                statement,
-                            )
-        except Exception:
-            pass
-
-        # Some YashanDB deployments reject NULL binds in typed CASE expressions
-        # unless the NULL is explicitly typed. This shows up in the SQLAlchemy
-        # suite DateTest::test_null_bound_comparison where the SQL is:
-        #   CASE WHEN (:foo IS NOT NULL) THEN :foo ELSE date_table.date_data END
-        #
-        # Many suite statements don't go through the custom compiler, so apply
-        # a narrow statement rewrite for this pattern.
-        try:
-            if (
-                isinstance(parameters, (list, tuple))
-                and any(p is None for p in parameters)
-                and "CASE WHEN" in statement.upper()
-                and ("DATE_TABLE" in statement.upper() and "DATE_DATA" in statement.upper())
-                and "CAST(:" not in statement.upper()
-            ):
-                # Determine the correct CAST type from the compiled bind type,
-                # not the table name (the suite's TimeTest uses "date_table").
-                target = "DATE"
-                try:
-                    compiled = (
-                        getattr(context, "compiled", None) if context is not None else None
-                    )
-                    binds = getattr(compiled, "binds", None) or {}
-                    # Pick the type of the "foo" bind if present; otherwise
-                    # fall back to the first typed bind.
-                    bind = binds.get("foo")
-                    bind_type = getattr(bind, "type", None) if bind is not None else None
-                    if bind_type is None and binds:
-                        bind_type = getattr(next(iter(binds.values())), "type", None)
-
-                    if isinstance(bind_type, sqltypes.Time):
-                        target = "TIME"
-                    elif isinstance(bind_type, sqltypes.DateTime):
-                        target = "TIMESTAMP"
-                    elif isinstance(bind_type, sqltypes.Date):
-                        target = "DATE"
-                except Exception:
-                    pass
-
-                statement = re.sub(
-                    r":([A-Za-z0-9_]+)",
-                    rf"CAST(:\1 AS {target})",
-                    statement,
-                )
-        except Exception:
-            pass
-
-        # As a secondary best-effort, attempt DBAPI input size hints.
-        try:
-            if (
-                isinstance(parameters, (list, tuple))
-                and any(p is None for p in parameters)
-                and "CASE WHEN" in statement.upper()
-            ):
-                dbtype = None
-                try:
-                    compiled = (
-                        getattr(context, "compiled", None) if context is not None else None
-                    )
-                    binds = getattr(compiled, "binds", None) or {}
-                    bind = binds.get("foo")
-                    bind_type = getattr(bind, "type", None) if bind is not None else None
-                except Exception:
-                    bind_type = None
-
-                if isinstance(bind_type, sqltypes.Time):
-                    dbtype = getattr(self.dbapi, "TIME", None)
-                elif isinstance(bind_type, sqltypes.DateTime):
-                    dbtype = getattr(self.dbapi, "TIMESTAMP", None) or getattr(
-                        self.dbapi, "DATETIME", None
-                    )
-                else:
-                    dbtype = (
-                        getattr(self.dbapi, "DATE", None)
-                        or getattr(self.dbapi, "DATETIME", None)
-                        or getattr(self.dbapi, "TIMESTAMP", None)
-                    )
-                if dbtype is not None:
-                    sizes = [(dbtype if p is None else None) for p in parameters]
-                    try:
-                        cursor.setinputsizes(*sizes)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
         try:
             cursor.execute(statement, parameters)
         except Exception as e:
@@ -832,10 +544,7 @@ class YasDialect_yaspy(YasDialect):
             raise
 
     def do_execute_no_params(self, cursor, statement, context=None):
-        # SQLAlchemy 1.4.5's assertsql records the parameters object passed to
-        # cursor execution. Ensure no-parameter executions are recorded as "()"
-        # rather than "[]".
-        cursor.execute(statement, ())
+        cursor.execute(statement)
 
     @util.deprecated_params(
         threaded=(

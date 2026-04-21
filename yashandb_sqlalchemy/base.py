@@ -376,16 +376,13 @@ class YasTypeCompiler(compiler.GenericTypeCompiler):
             return varchar % {"length": type_.length, "two": num, "n": n}
 
     def visit_text(self, type_, **kw):
-        # Comparing/quoting CLOB literals can fail in some YashanDB modes.
-        # For SQLAlchemy's generic Text() (suite uses small strings), use
-        # VARCHAR2 so literals in WHERE clauses are comparable.
-        return self.visit_VARCHAR2(sqltypes.VARCHAR(length=4000), **kw)
+        return self.visit_CLOB(type_, **kw)
 
     def visit_unicode_text(self, type_, **kw):
         if self.dialect._use_nchar_for_unicode:
-            return self.visit_NVARCHAR2(sqltypes.NVARCHAR(length=2000), **kw)
+            return self.visit_NCLOB(type_, **kw)
         else:
-            return self.visit_VARCHAR2(sqltypes.VARCHAR(length=4000), **kw)
+            return self.visit_CLOB(type_, **kw)
 
     def visit_large_binary(self, type_, **kw):
         return self.visit_BLOB(type_, **kw)
