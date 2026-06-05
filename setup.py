@@ -61,6 +61,9 @@ setup(
     license="MulanPSL-2.0",
     packages=["yashandb_sqlalchemy"],
     include_package_data=True,
+    install_requires=[
+        "SQLAlchemy==2.0.50",
+    ],
     entry_points={
         "sqlalchemy.dialects": [
             "yashandb = yashandb_sqlalchemy.yaspy:YasDialect_yaspy",
