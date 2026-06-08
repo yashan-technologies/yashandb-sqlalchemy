@@ -10,6 +10,7 @@
 from __future__ import absolute_import
 
 import decimal
+import datetime
 import random
 import re
 
@@ -18,13 +19,17 @@ from .base import YasCompiler
 from .base import YasDialect
 from .base import YasExecutionContext
 from sqlalchemy import exc
-from sqlalchemy import processors
 from sqlalchemy import types as sqltypes
 from sqlalchemy import util
 from sqlalchemy.engine import cursor as _cursor
+from sqlalchemy.engine import interfaces
 from sqlalchemy.sql import expression
 from sqlalchemy.pool import SingletonThreadPool
-from sqlalchemy.util import compat
+
+try:
+    import sqlalchemy.engine.processors as processors
+except ImportError:  # SQLAlchemy 1.4 compatibility during migration.
+    from sqlalchemy import processors
 
 
 class _YasInteger(sqltypes.Integer):
@@ -140,7 +145,7 @@ class _YasNumeric(sqltypes.Numeric):
                         return int(value)
                     except Exception:
                         pass
-                if isinstance(value, util.string_types):
+                if isinstance(value, str):
                     v = value.strip()
                     if v and re.match(r"^-?\\d+$", v):
                         try:
@@ -154,7 +159,7 @@ class _YasNumeric(sqltypes.Numeric):
                     return _quantize_decimal(value)
                 if isinstance(value, (int, float)):
                     return _quantize_decimal(dec_processor(value))
-                if isinstance(value, util.string_types):
+                if isinstance(value, str):
                     v = value.strip()
                     try:
                         d = decimal.Decimal(v)
@@ -172,7 +177,7 @@ class _YasNumeric(sqltypes.Numeric):
                     return float(value)
                 except Exception:
                     return value
-            if isinstance(value, util.string_types):
+            if isinstance(value, str):
                 v = value.strip()
                 try:
                     return float(v)
@@ -205,7 +210,35 @@ class _YasDate(sqltypes.Date):
 
     def result_processor(self, dialect, coltype):
         def process(value):
+            if isinstance(value, str):
+                return datetime.date.fromisoformat(value.strip()[:10])
             return value    
+
+        return process
+
+
+class _YasDateTime(sqltypes.DateTime):
+    def bind_processor(self, dialect):
+        return None
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if isinstance(value, str):
+                return datetime.datetime.fromisoformat(value.strip())
+            return value
+
+        return process
+
+
+class _YasTime(sqltypes.Time):
+    def bind_processor(self, dialect):
+        return None
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if isinstance(value, str):
+                return datetime.time.fromisoformat(value.strip())
+            return value
 
         return process
 
@@ -352,17 +385,14 @@ class YasExecutionContext_yaspy(YasExecutionContext):
         self.parameters = mutable
 
     def _generate_out_parameter_vars(self):
-        paramIndex = 0
         if self.compiled.returning or self.compiled.has_out_parameters:
-            preParamValue = None
+            quoted_bind_names = getattr(self.compiled, "escaped_bind_names", {})
             for bindparam in self.compiled.binds.values():
                 if bindparam.isoutparam:
                     name = self.compiled.bind_names[bindparam]
                     type_impl = bindparam.type.dialect_impl(self.dialect)
 
                     dbtype = type_impl.get_dbapi_type(self.dialect.dbapi)
-
-                    yaspyApi = self.dialect.dbapi
 
                     if dbtype is None:
                         raise exc.InvalidRequestError(
@@ -372,23 +402,7 @@ class YasExecutionContext_yaspy(YasExecutionContext):
                             " yaspy" % (bindparam.key, bindparam.type)
                         )
 
-                    if compat.py2k and dbtype in (
-                        yaspyApi.CLOB,
-                        yaspyApi.NCLOB,
-                    ):
-                        outconverter = (
-                            processors.to_unicode_processor_factory(
-                                self.dialect.encoding,
-                                errors=self.dialect.encoding_errors,
-                            )
-                        )
-                        self.out_parameters[name] = self.cursor.var(
-                            dbtype,
-                            outconverter=lambda value: outconverter(
-                                value.read()
-                            ),
-                        )
-                    # elif dbtype in (
+                    # if dbtype in (
                     #     yaspyApi.BLOB,
                     #     yaspyApi.CLOB,
                     #     yaspyApi.NCLOB,
@@ -396,25 +410,11 @@ class YasExecutionContext_yaspy(YasExecutionContext):
                     #     self.out_parameters[name] = self.cursor.var(
                     #         dbtype, outconverter=lambda value: value.read()
                     #     )
-                    elif compat.py2k and isinstance(
-                        type_impl, sqltypes.Unicode
-                    ):
-                        outconverter = (
-                            processors.to_unicode_processor_factory(
-                                self.dialect.encoding,
-                                errors=self.dialect.encoding_errors,
-                            )
-                        )
-                        self.out_parameters[name] = self.cursor.var(
-                            dbtype, outconverter=outconverter
-                        )
-                    else:
-                        self.out_parameters[name] = self.cursor.var(dbtype)
+                    self.out_parameters[name] = self.cursor.var(dbtype)
 
-                    self.parameters[0][paramIndex] = self.out_parameters[name]
-                if preParamValue is None or preParamValue != bindparam :
-                    paramIndex += 1
-                preParamValue = bindparam
+                    param_key = quoted_bind_names.get(name, name)
+                    for param in self.parameters:
+                        param[param_key] = self.out_parameters[name]
 
     def pre_exec(self):
         if not getattr(self.compiled, "_yaspy_sql_compiler", False):
@@ -430,10 +430,24 @@ class YasExecutionContext_yaspy(YasExecutionContext):
 
     def post_exec(self):
         if self.compiled and self.out_parameters and self.compiled.returning:
+            rowcount = getattr(self.cursor, "rowcount", None)
+            num_rows = 1
+            if rowcount is not None:
+                try:
+                    num_rows = max(0, int(rowcount))
+                except (TypeError, ValueError):
+                    num_rows = 1
+
             returning_params = [
                 self.dialect._returningval(self.out_parameters["ret_%d" % i])
                 for i in range(len(self.out_parameters))
             ]
+            all_none = returning_params and all(v is None for v in returning_params)
+            # yaspy leaves a single NULL OUT row when no rows are affected.
+            if num_rows == 0 or (num_rows <= 1 and all_none):
+                initial_buffer = []
+            else:
+                initial_buffer = [tuple(returning_params)]
 
             def _returning_col_name(col, i):
                 name = getattr(col, "name", None)
@@ -448,12 +462,20 @@ class YasExecutionContext_yaspy(YasExecutionContext):
             fetch_strategy = _cursor.FullyBufferedCursorFetchStrategy(
                 self.cursor,
                 [
-                    (_returning_col_name(col, i), None)
+                    (
+                        _returning_col_name(col, i),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
                     for i, col in enumerate(
                         expression._select_iterables(self.compiled.returning)
                     )
                 ],
-                initial_buffer=[tuple(returning_params)],
+                initial_buffer=initial_buffer,
             )
             self.cursor_fetch_strategy = fetch_strategy
 
@@ -484,13 +506,12 @@ class YasDialect_yaspy(YasDialect):
 
     supports_sane_rowcount = True
     supports_sane_multi_rowcount = True
+    supports_sane_rowcount_returning = False
 
     supports_unicode_statements = True
     supports_unicode_binds = True
 
-    # yaspy set false, todo: ensure require or not ?
-    use_setinputsizes = True
-    # use_setinputsizes = False
+    bind_typing = interfaces.BindTyping.SETINPUTSIZES
 
     driver = "yaspy"
 
@@ -503,6 +524,8 @@ class YasDialect_yaspy(YasDialect):
         sqltypes.BigInteger: _YasBigInteger,
         yashandb.NUMBER: _YasNUMBER,
         sqltypes.Date: _YasDate,
+        sqltypes.DateTime: _YasDateTime,
+        sqltypes.Time: _YasTime,
         sqltypes.LargeBinary: _YasBinary,
         sqltypes.Boolean: yashandb._YasBoolean,
         sqltypes.Interval: _YasInterval,
@@ -593,12 +616,8 @@ class YasDialect_yaspy(YasDialect):
 
             self._paramval = lambda value: value.getvalue()
 
-            # adapt for yashan, temporarily only suppport single value for out parameter
             def _returningval(value):
-                    try:
-                        return value.values[0]
-                    except IndexError:
-                        return None
+                return value.getvalue()
 
             self._returningval = _returningval
 
@@ -610,10 +629,14 @@ class YasDialect_yaspy(YasDialect):
             return (0, 0, 0)
 
     @classmethod
-    def dbapi(cls):
+    def import_dbapi(cls):
         import yaspy
 
         return yaspy
+
+    @classmethod
+    def dbapi(cls):
+        return cls.import_dbapi()
 
     def initialize(self, connection):
         super(YasDialect_yaspy, self).initialize(connection)
@@ -734,7 +757,7 @@ class YasDialect_yaspy(YasDialect):
             opts["user"] = url.username
 
         def convert_yaspy_constant(value):
-            if isinstance(value, util.string_types):
+            if isinstance(value, str):
                 try:
                     int_val = int(value)
                 except ValueError:

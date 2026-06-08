@@ -19,6 +19,7 @@ from sqlalchemy import sql
 from sqlalchemy import util
 from sqlalchemy.engine import default
 from sqlalchemy.engine import reflection
+from sqlalchemy.engine.reflection import ObjectKind, ObjectScope, ReflectionDefaults
 from sqlalchemy import event
 from sqlalchemy.sql import compiler
 from sqlalchemy.sql import expression
@@ -191,7 +192,7 @@ class _YasBoolean(sqltypes.Boolean):
                 return value
             if isinstance(value, (int,)):
                 return bool(value)
-            if isinstance(value, (util.string_types, bytes)):
+            if isinstance(value, (str, bytes)):
                 s = value.decode("ascii") if isinstance(value, bytes) else value
                 s = s.strip()
                 if s in ("0", "N", "n", "false", "FALSE", "f", "F"):
@@ -540,11 +541,25 @@ class YasCompiler(compiler.SQLCompiler):
 
         return " " + alias_name_text
 
-    def returning_clause(self, stmt, returning_cols):
+    def returning_clause(
+        self, stmt, returning_cols, *, populate_result_map, **kw
+    ):
         columns = []
         binds = []
 
         for i, column in enumerate(expression._select_iterables(returning_cols)):
+            if (
+                self.isupdate
+                and isinstance(column, sa_schema.Column)
+                and isinstance(column.server_default, Computed)
+                and not self.dialect._supports_update_returning_computed_cols
+            ):
+                util.warn(
+                    "Computed columns don't work with YashanDB UPDATE "
+                    "statements that use RETURNING; the value of the column "
+                    "before the UPDATE takes place may be returned. Consider "
+                    "disabling implicit RETURNING for this Table."
+                )
             if column.type._has_column_expression:
                 col_expr = column.type.column_expression(column)
             else:
@@ -554,31 +569,36 @@ class YasCompiler(compiler.SQLCompiler):
             self.binds[outparam.key] = outparam
             binds.append(self.bindparam_string(self._truncate_bindparam(outparam)))
 
-            self.has_out_parameters = False
+            if self.has_out_parameters:
+                raise exc.InvalidRequestError(
+                    "Using explicit outparam() objects with "
+                    "UpdateBase.returning() in the same Core DML statement "
+                    "is not supported in the YashanDB dialect."
+                )
+
+            self._yashandb_returning = True
 
             columns.append(self.process(col_expr, within_columns_clause=False))
 
-            # SQLAlchemy 1.4.5 compatibility:
-            # - getattr(col, "name", fallback) does NOT fallback when name exists but is None
-            # - _anon_name_label may not exist on 1.4.5
-            name = getattr(col_expr, "name", None)
-            if not name:
-                name = (
-                    getattr(col_expr, "_anon_name_label", None)
-                    or getattr(col_expr, "_anon_name", None)
-                    or ("ret_%d" % i)
-                )
+            if populate_result_map:
+                name = getattr(col_expr, "name", None)
+                if not name:
+                    name = (
+                        getattr(col_expr, "_anon_name_label", None)
+                        or getattr(col_expr, "_anon_name", None)
+                        or ("ret_%d" % i)
+                    )
 
-            self._add_to_result_map(
-                name,
-                name,
-                (
-                    column,
-                    getattr(column, "name", None),
-                    getattr(column, "key", None),
-                ),
-                column.type,
-            )
+                self._add_to_result_map(
+                    name,
+                    name,
+                    (
+                        column,
+                        getattr(column, "name", None),
+                        getattr(column, "key", None),
+                    ),
+                    column.type,
+                )
 
         return "RETURNING " + ", ".join(columns) + " INTO " + ", ".join(binds)
 
@@ -720,7 +740,7 @@ class YasCompiler(compiler.SQLCompiler):
     def limit_clause(self, select, **kw):
         return ""
 
-    def visit_empty_set_expr(self, type_):
+    def visit_empty_set_expr(self, type_, **kw):
         return "SELECT 1 FROM DUAL WHERE 1!=1"
 
     def for_update_clause(self, select, **kw):
@@ -822,10 +842,10 @@ class YasDDLCompiler(compiler.DDLCompiler):
 
         return text
 
-    def visit_drop_table_comment(self, drop):
+    def visit_drop_table_comment(self, drop, **kw):
         return "COMMENT ON TABLE %s IS ''" % self.preparer.format_table(drop.element)
 
-    def visit_create_index(self, create):
+    def visit_create_index(self, create, **kw):
         index = create.element
         self._verify_index_table(index)
         preparer = self.preparer
@@ -874,7 +894,7 @@ class YasDDLCompiler(compiler.DDLCompiler):
             text += " ORDER" if identity_options.order else " NOORDER"
         return text.strip()
 
-    def visit_computed_column(self, generated):
+    def visit_computed_column(self, generated, **kw):
         text = "GENERATED ALWAYS AS (%s)" % self.sql_compiler.process(
             generated.sqltext, include_table=False, literal_binds=True
         )
@@ -961,12 +981,20 @@ class YasDialect(default.DefaultDialect):
     supports_default_values = False
     supports_default_metavalue = True
     supports_empty_insert = False
-    supports_identity_columns = True
-    # UPDATE .. RETURNING is not supported in current YashanDB mode / yaspy.
-    update_returning = False
+    supports_identity_columns = False
+    # YashanDB kernel supports single-row DML RETURNING (INSERT/UPDATE).
+    # Multi-row UPDATE RETURNING raises YAS-05205; see sane_rowcount_w_returning.
+    # DELETE .. RETURNING still raises YAS-04209 on 23.4.12.1.
+    insert_returning = True
+    insert_executemany_returning = False
+    update_returning = True
+    delete_returning = False
 
     statement_compiler = YasCompiler
     ddl_compiler = YasDDLCompiler
+    type_compiler_cls = YasTypeCompiler
+    # Keep the legacy attribute for SQLAlchemy 1.4-style code paths that may
+    # still inspect it directly while this branch migrates to 2.0.
     type_compiler = YasTypeCompiler
     preparer = YasIdentifierPreparer
     execution_ctx_cls = YasExecutionContext
@@ -976,7 +1004,12 @@ class YasDialect(default.DefaultDialect):
     construct_arguments = [
         (
             sa_schema.Table,
-            {"resolve_synonyms": False, "on_commit": None, "compress": False},
+            {
+                "resolve_synonyms": False,
+                "on_commit": None,
+                "compress": False,
+                "tablespace": None,
+            },
         ),
         (sa_schema.Index, {"bitmap": False, "compress": False}),
     ]
@@ -1006,16 +1039,17 @@ class YasDialect(default.DefaultDialect):
         self.optimize_limits = optimize_limits
         self.exclude_tablespaces = exclude_tablespaces
 
-        # fore use numeric bind style, TODO: fix yasdb driver's paramstype or suppport named style
+        # SQLAlchemy 2.0 derives .positional from .paramstyle. Keep named
+        # binds as non-positional; forcing positional=True with named binds
+        # fails compiler assertions in 2.0.
         self.paramstyle = self.default_paramstyle
-        self.positional = True
 
     def initialize(self, connection):
         super(YasDialect, self).initialize(connection)
 
         self.implicit_returning = self.__dict__.get("implicit_returning", True)
 
-        self.supports_identity_columns = True
+        self.supports_identity_columns = False
 
         # YashanDB may not support inline self-referential foreign keys within
         # CREATE TABLE. Emit these constraints via ALTER TABLE after the table
@@ -1176,6 +1210,24 @@ class YasDialect(default.DefaultDialect):
                 "Connection passed to has_table() is not executable"
             )
 
+    def _all_objects_has_temporary_column(self, connection):
+        cache_key = "_yashandb_all_objects_has_temporary"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached
+        try:
+            keys = {
+                key.lower()
+                for key in connection.execute(
+                    sql.text("SELECT * FROM all_objects WHERE 1=0")
+                ).keys()
+            }
+            has_column = "temporary" in keys
+        except Exception:
+            has_column = False
+        setattr(self, cache_key, has_column)
+        return has_column
+
     def _check_max_identifier_length(self, connection):
         if self._get_effective_compat_server_version_info(connection) < (
             12,
@@ -1213,7 +1265,8 @@ class YasDialect(default.DefaultDialect):
     def set_isolation_level(self, connection, level):
         raise NotImplementedError("implemented by yasdb dialect")
 
-    def has_table(self, connection, table_name, schema=None):
+    @reflection.cache
+    def has_table(self, connection, table_name, schema=None, **kw):
         self._ensure_has_table_connection(connection)
 
         if not schema:
@@ -1221,9 +1274,10 @@ class YasDialect(default.DefaultDialect):
 
         cursor = connection.execute(
             sql.text(
-                "SELECT table_name FROM all_tables "
-                "WHERE table_name = CAST(:name AS VARCHAR2(128)) "
-                "AND owner = CAST(:schema_name AS VARCHAR2(128))"
+                "SELECT object_name FROM all_objects "
+                "WHERE object_name = CAST(:name AS VARCHAR2(128)) "
+                "AND owner = CAST(:schema_name AS VARCHAR2(128)) "
+                "AND object_type IN ('TABLE', 'VIEW')"
             ),
             dict(
                 name=self.denormalize_name(table_name),
@@ -1232,7 +1286,8 @@ class YasDialect(default.DefaultDialect):
         )
         return cursor.first() is not None
 
-    def has_sequence(self, connection, sequence_name, schema=None):
+    @reflection.cache
+    def has_sequence(self, connection, sequence_name, schema=None, **kw):
         if not schema:
             schema = self.default_schema_name
         cursor = connection.execute(
@@ -1247,6 +1302,26 @@ class YasDialect(default.DefaultDialect):
             ),
         )
         return cursor.first() is not None
+
+    def _raise_if_table_or_view_not_found(self, connection, table_name, schema=None, **kw):
+        if not self.has_table(connection, table_name, schema=schema, **kw):
+            raise exc.NoSuchTableError(table_name)
+
+    @reflection.cache
+    def has_index(self, connection, table_name, index_name, schema=None, **kw):
+        if not self.has_table(connection, table_name, schema=schema, **kw):
+            return False
+
+        normalized_index_name = self.normalize_name(index_name)
+        return any(
+            ix["name"] == normalized_index_name
+            for ix in self.get_indexes(
+                connection,
+                table_name,
+                schema=schema,
+                info_cache=kw.get("info_cache"),
+            )
+        )
 
     def _get_default_schema_name(self, connection):
         return self.normalize_name(
@@ -1288,9 +1363,7 @@ class YasDialect(default.DefaultDialect):
 
         q += " AND ".join(clauses)
 
-        result = connection.execution_options(future_result=True).execute(
-            sql.text(q), params
-        )
+        result = connection.execute(sql.text(q), params)
         if desired_owner:
             row = result.mappings().first()
             if row:
@@ -1367,15 +1440,27 @@ class YasDialect(default.DefaultDialect):
         if schema is None:
             schema = self.default_schema_name
 
-        sql_str = "SELECT table_name FROM all_tables WHERE "
-        if self.exclude_tablespaces:
-            sql_str += "nvl(tablespace_name, 'no tablespace') " "NOT IN (%s) AND " % (
-                ", ".join(["'%s'" % ts for ts in self.exclude_tablespaces])
+        if self._all_objects_has_temporary_column(connection):
+            sql_str = (
+                "SELECT object_name FROM all_objects "
+                "WHERE owner = CAST(:owner AS VARCHAR2(128)) "
+                "AND object_type = 'TABLE' "
+                "AND temporary = 'N' "
+                "AND object_name NOT LIKE 'BIN$%%'"
             )
-        sql_str += "OWNER = :owner " "AND DURATION IS NULL"
-
-        cursor = connection.execute(sql.text(sql_str), dict(owner=schema))
-        table_names = [self.normalize_name(row[0]) for row in cursor]
+            cursor = connection.execute(sql.text(sql_str), dict(owner=schema))
+            table_names = [self.normalize_name(row[0]) for row in cursor]
+        else:
+            sql_str = "SELECT table_name FROM all_tables WHERE "
+            if self.exclude_tablespaces:
+                sql_str += (
+                    "nvl(tablespace_name, 'no tablespace') NOT IN (%s) AND "
+                    % (", ".join(["'%s'" % ts for ts in self.exclude_tablespaces]))
+                )
+            sql_str += "OWNER = :owner AND DURATION IS NULL "
+            sql_str += "AND table_name NOT LIKE 'BIN$%%'"
+            cursor = connection.execute(sql.text(sql_str), dict(owner=schema))
+            table_names = [self.normalize_name(row[0]) for row in cursor]
 
         # SQLAlchemy's reflection suite may request table names that include
         # views via Inspector.get_table_names(include_views=True).
@@ -1391,13 +1476,23 @@ class YasDialect(default.DefaultDialect):
     def get_temp_table_names(self, connection, **kw):
         schema = self.denormalize_name(self.default_schema_name)
 
+        if self._all_objects_has_temporary_column(connection):
+            sql_str = (
+                "SELECT object_name FROM all_objects "
+                "WHERE owner = CAST(:owner AS VARCHAR2(128)) "
+                "AND object_type = 'TABLE' "
+                "AND temporary = 'Y'"
+            )
+            cursor = connection.execute(sql.text(sql_str), dict(owner=schema))
+            return [self.normalize_name(row[0]) for row in cursor]
+
         sql_str = "SELECT table_name FROM all_tables WHERE "
         if self.exclude_tablespaces:
-            sql_str += "nvl(tablespace_name, 'no tablespace') " "NOT IN (%s) AND " % (
-                ", ".join(["'%s'" % ts for ts in self.exclude_tablespaces])
+            sql_str += (
+                "nvl(tablespace_name, 'no tablespace') NOT IN (%s) AND "
+                % (", ".join(["'%s'" % ts for ts in self.exclude_tablespaces]))
             )
-        sql_str += "OWNER = :owner " "AND DURATION IS NOT NULL"
-
+        sql_str += "OWNER = :owner AND DURATION IS NOT NULL"
         cursor = connection.execute(sql.text(sql_str), dict(owner=schema))
         return [self.normalize_name(row[0]) for row in cursor]
 
@@ -1445,8 +1540,78 @@ class YasDialect(default.DefaultDialect):
 
     @reflection.cache
     def get_table_options(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_table_options(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
+
+    def get_multi_table_options(
+        self,
+        connection,
+        *,
+        schema,
+        filter_names,
+        scope,
+        kind,
+        dblink=None,
+        **kw,
+    ):
+        dblink = dblink or ""
+        owner = self.denormalize_name(schema or self.default_schema_name)
+        default = ReflectionDefaults.table_options
         options = {}
-        return options
+
+        if ObjectKind.TABLE in kind or ObjectKind.MATERIALIZED_VIEW in kind:
+            table_names = self._collect_reflect_names(
+                connection, kind, schema, filter_names, scope, dblink=dblink, **kw
+            )
+        else:
+            table_names = []
+        if table_names:
+            denorm_names = [self.denormalize_name(name) for name in table_names]
+            rows = {}
+            chunk_size = 500
+            for offset in range(0, len(denorm_names), chunk_size):
+                chunk = denorm_names[offset : offset + chunk_size]
+                placeholders = ", ".join(f":t{i}" for i in range(len(chunk)))
+                params = {"owner": owner}
+                params.update({f"t{i}": name for i, name in enumerate(chunk)})
+                text = (
+                    "SELECT table_name, tablespace_name "
+                    "FROM all_tables%(dblink)s "
+                    "WHERE owner = CAST(:owner AS VARCHAR2(128)) "
+                    f"AND table_name IN ({placeholders})"
+                ) % {"dblink": dblink}
+                for table_name, tablespace in connection.execute(
+                    sql.text(text), params
+                ):
+                    rows[self.normalize_name(table_name)] = tablespace
+
+            for name in table_names:
+                norm = self.normalize_name(name)
+                data = default()
+                tablespace = rows.get(norm)
+                if tablespace:
+                    data["yashandb_tablespace"] = tablespace
+                options[(schema, norm)] = data
+
+        if ObjectKind.VIEW in kind and ObjectScope.DEFAULT in scope:
+            view_kw = {"schema": schema, **kw}
+            if dblink:
+                view_kw["dblink"] = dblink
+            for view in self.get_view_names(connection, **view_kw):
+                if filter_names:
+                    wanted = {self.normalize_name(n) for n in filter_names}
+                    if self.normalize_name(view) not in wanted:
+                        continue
+                options[(schema, self.normalize_name(view))] = default()
+
+        return options.items()
 
     @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kw):
@@ -1484,7 +1649,7 @@ class YasDialect(default.DefaultDialect):
                 col.data_default,
                 com.comments,
                 %(identity_cols)s
-            FROM all_tab_cols%(dblink)s col
+            FROM all_tab_columns%(dblink)s col
             LEFT JOIN all_col_comments%(dblink)s com
             ON col.table_name = com.table_name
             AND col.column_name = com.column_name
@@ -1558,7 +1723,6 @@ class YasDialect(default.DefaultDialect):
                 "type": coltype,
                 "nullable": nullable,
                 "default": default,
-                "autoincrement": "auto",
                 "comment": comment,
             }
             if orig_colname.lower() == orig_colname:
@@ -1569,6 +1733,10 @@ class YasDialect(default.DefaultDialect):
                 cdict["identity"] = identity
 
             columns.append(cdict)
+        if not columns:
+            self._raise_if_table_or_view_not_found(
+                connection, table_name, schema=schema, info_cache=info_cache
+            )
         return columns
 
     def _parse_identity_options(self, identity_options, default_on_nul):
@@ -1588,17 +1756,17 @@ class YasDialect(default.DefaultDialect):
             value = value.strip()
 
             if "START WITH" in option:
-                identity["start"] = compat.long_type(value)
+                identity["start"] = int(value)
             elif "INCREMENT BY" in option:
-                identity["increment"] = compat.long_type(value)
+                identity["increment"] = int(value)
             elif "MAX_VALUE" in option:
-                identity["maxvalue"] = compat.long_type(value)
+                identity["maxvalue"] = int(value)
             elif "MIN_VALUE" in option:
-                identity["minvalue"] = compat.long_type(value)
+                identity["minvalue"] = int(value)
             elif "CYCLE_FLAG" in option:
                 identity["cycle"] = value == "Y"
             elif "CACHE_SIZE" in option:
-                identity["cache"] = compat.long_type(value)
+                identity["cache"] = int(value)
             elif "ORDER_FLAG" in option:
                 identity["order"] = value == "Y"
         return identity
@@ -1640,6 +1808,205 @@ class YasDialect(default.DefaultDialect):
         )
         return {"text": c.scalar()}
 
+    _yashandb_sys_col = re.compile(r"SYS_NC\d+\$", re.IGNORECASE)
+
+    def _all_ind_expressions_available(self, connection):
+        cache_key = "_yashandb_all_ind_expressions_available"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached
+        try:
+            connection.execute(sql.text("SELECT * FROM all_ind_expressions WHERE 1=0"))
+            has_view = True
+        except Exception:
+            has_view = False
+        setattr(self, cache_key, has_view)
+        return has_view
+
+    def _all_ind_columns_has_descend(self, connection):
+        cache_key = "_yashandb_all_ind_columns_has_descend"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached
+        try:
+            keys = {
+                key.lower()
+                for key in connection.execute(
+                    sql.text("SELECT * FROM all_ind_columns WHERE 1=0")
+                ).keys()
+            }
+            has_column = "descend" in keys
+        except Exception:
+            has_column = False
+        setattr(self, cache_key, has_column)
+        return has_column
+
+    def _fetch_pk_constraint_names(self, connection, owner, table_names, dblink=""):
+        if not table_names:
+            return {}
+        denorm_names = [self.denormalize_name(name) for name in table_names]
+        pks = {}
+        chunk_size = 500
+        for offset in range(0, len(denorm_names), chunk_size):
+            chunk = denorm_names[offset : offset + chunk_size]
+            placeholders = ", ".join(f":t{i}" for i in range(len(chunk)))
+            params = {"owner": owner}
+            params.update({f"t{i}": name for i, name in enumerate(chunk)})
+            text = (
+                "SELECT table_name, constraint_name "
+                "FROM all_constraints%(dblink)s "
+                "WHERE owner = CAST(:owner AS VARCHAR2(128)) "
+                "AND constraint_type = 'P' "
+                f"AND table_name IN ({placeholders})"
+            ) % {"dblink": dblink}
+            for table_name, constraint_name in connection.execute(
+                sql.text(text), params
+            ):
+                pks[self.normalize_name(table_name)] = self.normalize_name(
+                    constraint_name
+                )
+        return pks
+
+    def _fetch_index_rows(self, connection, owner, table_names, dblink=""):
+        if not table_names:
+            return []
+
+        has_expressions = self._all_ind_expressions_available(connection)
+        has_descend = self._all_ind_columns_has_descend(connection)
+        denorm_names = [self.denormalize_name(name) for name in table_names]
+        rows = []
+        chunk_size = 500
+        for offset in range(0, len(denorm_names), chunk_size):
+            chunk = denorm_names[offset : offset + chunk_size]
+            placeholders = ", ".join(f":t{i}" for i in range(len(chunk)))
+            params = {"owner": owner}
+            params.update({f"t{i}": name for i, name in enumerate(chunk)})
+            expr_select = (
+                ", e.column_expression AS column_expression"
+                if has_expressions
+                else ", CAST(NULL AS VARCHAR2(4000)) AS column_expression"
+            )
+            expr_join = (
+                "LEFT JOIN all_ind_expressions%(dblink)s e "
+                "  ON e.index_name = a.index_name "
+                " AND e.index_owner = a.index_owner "
+                " AND e.column_position = a.column_position "
+                if has_expressions
+                else ""
+            )
+            descend_select = (
+                ", a.descend AS descend" if has_descend else ", 'ASC' AS descend"
+            )
+            text = (
+                "SELECT a.table_name, a.index_name, a.column_name, "
+                "b.index_type, b.uniqueness, b.compression, b.prefix_length "
+                f"{descend_select}{expr_select} "
+                "FROM all_ind_columns%(dblink)s a "
+                "JOIN all_indexes%(dblink)s b "
+                "  ON a.index_name = b.index_name "
+                " AND a.table_owner = b.table_owner "
+                " AND a.table_name = b.table_name "
+                f"{expr_join}"
+                "WHERE a.table_owner = CAST(:owner AS VARCHAR2(128)) "
+                f"AND a.table_name IN ({placeholders}) "
+                "ORDER BY a.table_name, a.index_name, a.column_position"
+            ) % {"dblink": dblink}
+            rows.extend(connection.execute(sql.text(text), params).fetchall())
+        return rows
+
+    def _indexes_from_rows(self, rows, pk_names):
+        uniqueness = {"N": False, "NONUNIQUE": False, "Y": True, "UNIQUE": True}
+        enabled = {"DISABLED": False, "ENABLED": True}
+        is_bitmap = {"BITMAP", "FUNCTION-BASED BITMAP"}
+        indexes = util.defaultdict(dict)
+
+        for row in rows:
+            (
+                table_name,
+                index_name,
+                column_name,
+                index_type,
+                unique_flag,
+                compression,
+                prefix_length,
+                descend,
+                column_expression,
+            ) = row
+            table_key = self.normalize_name(table_name)
+            index_key = self.normalize_name(index_name)
+            pk_name = pk_names.get(table_key)
+            if pk_name and index_key == pk_name:
+                continue
+
+            table_indexes = indexes[table_key]
+            if index_key not in table_indexes:
+                table_indexes[index_key] = index_dict = {
+                    "name": index_key,
+                    "column_names": [],
+                    "dialect_options": {},
+                    "unique": uniqueness.get(unique_flag, False),
+                }
+                do = index_dict["dialect_options"]
+                if index_type in is_bitmap:
+                    do["yashandb_bitmap"] = True
+                if enabled.get(compression, False):
+                    do["yashandb_compress"] = prefix_length
+            else:
+                index_dict = table_indexes[index_key]
+
+            descend = (descend or "ASC").lower()
+            expr = column_expression
+            if expr is not None and self._yashandb_sys_col.match(column_name or ""):
+                index_dict["column_names"].append(None)
+                if "expressions" in index_dict:
+                    index_dict["expressions"].append(expr)
+                else:
+                    index_dict["expressions"] = index_dict["column_names"][:-1]
+                    index_dict["expressions"].append(expr)
+                if descend != "asc":
+                    index_dict.setdefault("column_sorting", {})[expr] = ("desc",)
+            elif not self._yashandb_sys_col.match(column_name or ""):
+                col = self.normalize_name(column_name)
+                index_dict["column_names"].append(col)
+                if "expressions" in index_dict:
+                    index_dict["expressions"].append(col)
+                if descend != "asc":
+                    index_dict.setdefault("column_sorting", {})[col] = ("desc",)
+
+        return indexes
+
+    def get_multi_indexes(
+        self,
+        connection,
+        *,
+        scope,
+        schema,
+        filter_names,
+        kind,
+        dblink=None,
+        **kw,
+    ):
+        dblink = dblink or ""
+        owner = self.denormalize_name(schema or self.default_schema_name)
+        all_objects = self._collect_reflect_names(
+            connection, kind, schema, filter_names, scope, dblink=dblink, **kw
+        )
+        pk_names = self._fetch_pk_constraint_names(
+            connection, owner, all_objects, dblink=dblink
+        )
+        rows = self._fetch_index_rows(connection, owner, all_objects, dblink=dblink)
+        indexes = self._indexes_from_rows(rows, pk_names)
+        default = ReflectionDefaults.indexes
+
+        return (
+            (
+                (schema, self.normalize_name(obj_name)),
+                list(indexes.get(self.normalize_name(obj_name), {}).values())
+                or default(),
+            )
+            for obj_name in all_objects
+        )
+
     @reflection.cache
     def get_indexes(
         self,
@@ -1648,85 +2015,19 @@ class YasDialect(default.DefaultDialect):
         schema=None,
         resolve_synonyms=False,
         dblink="",
-        **kw
+        **kw,
     ):
-
-        info_cache = kw.get("info_cache")
-        (table_name, schema, dblink, synonym) = self._prepare_reflection_args(
+        data = self.get_multi_indexes(
             connection,
-            table_name,
-            schema,
-            resolve_synonyms,
-            dblink,
-            info_cache=info_cache,
-        )
-        indexes = []
-
-        params = {"table_name": table_name}
-        text = (
-            "SELECT a.index_name, a.column_name, "
-            "\nb.index_type, b.uniqueness, b.compression, b.prefix_length "
-            "\nFROM ALL_IND_COLUMNS%(dblink)s a, "
-            "\nALL_INDEXES%(dblink)s b "
-            "\nWHERE "
-            "\na.index_name = b.index_name "
-            "\nAND a.table_owner = b.table_owner "
-            "\nAND a.table_name = b.table_name "
-            "\nAND a.table_name = CAST(:table_name AS VARCHAR(128))"
-        )
-
-        if schema is not None:
-            params["schema"] = schema
-            text += "AND a.table_owner = :schema "
-
-        text += "ORDER BY a.index_name, a.column_position"
-
-        text = text % {"dblink": dblink}
-
-        q = sql.text(text)
-        rp = connection.execute(q, params)
-        indexes = []
-        last_index_name = None
-        pk_constraint = self.get_pk_constraint(
-            connection,
-            table_name,
-            schema,
-            resolve_synonyms=resolve_synonyms,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
             dblink=dblink,
-            info_cache=kw.get("info_cache"),
+            yashandb_resolve_synonyms=resolve_synonyms,
+            **kw,
         )
-
-        uniqueness = dict(NONUNIQUE=False, UNIQUE=True)
-        enabled = dict(DISABLED=False, ENABLED=True)
-
-        yashandb_sys_col = re.compile(r"SYS_NC\d+\$", re.IGNORECASE)
-
-        index = None
-        for rset in rp:
-            index_name_normalized = self.normalize_name(rset.index_name)
-
-            if pk_constraint and index_name_normalized == pk_constraint["name"]:
-                continue
-
-            if rset.index_name != last_index_name:
-                index = dict(
-                    name=index_name_normalized,
-                    column_names=[],
-                    dialect_options={},
-                )
-                indexes.append(index)
-            index["unique"] = uniqueness.get(rset.uniqueness, False)
-
-            if rset.index_type in ("BITMAP", "FUNCTION-BASED BITMAP"):
-                index["dialect_options"]["yashandb_bitmap"] = True
-            if enabled.get(rset.compression, False):
-                index["dialect_options"]["yashandb_compress"] = rset.prefix_length
-
-            if not yashandb_sys_col.match(rset.column_name):
-                index["column_names"].append(self.normalize_name(rset.column_name))
-            last_index_name = rset.index_name
-
-        return indexes
+        return self._value_or_raise(data, table_name, schema)
 
     @reflection.cache
     def _get_constraint_data(
@@ -1786,6 +2087,9 @@ class YasDialect(default.DefaultDialect):
             dblink,
             info_cache=info_cache,
         )
+        self._raise_if_table_or_view_not_found(
+            connection, table_name, schema=schema, info_cache=info_cache
+        )
         pkeys = []
         constraint_name = None
         constraint_data = self._get_constraint_data(
@@ -1811,300 +2115,262 @@ class YasDialect(default.DefaultDialect):
                 pkeys.append(local_column)
         return {"constrained_columns": pkeys, "name": constraint_name}
 
-    @reflection.cache
-    def get_foreign_keys(self, connection, table_name, schema=None, **kw):
+    def _value_or_raise(self, data, table, schema):
+        table = self.normalize_name(str(table))
+        try:
+            return dict(data)[(schema, table)]
+        except KeyError:
+            raise exc.NoSuchTableError(
+                f"{schema}.{table}" if schema else table
+            ) from None
 
-        requested_schema = schema  # to check later on
-        resolve_synonyms = kw.get("yashandb_resolve_synonyms", False)
-        dblink = kw.get("dblink", "")
-        info_cache = kw.get("info_cache")
-
-        (table_name, schema, dblink, synonym) = self._prepare_reflection_args(
-            connection,
-            table_name,
-            schema,
-            resolve_synonyms,
-            dblink,
-            info_cache=info_cache,
-        )
-
-        # The SQLAlchemy reflection suite calls get_foreign_keys() with
-        # schema=None for the "current schema" case. On some YashanDB
-        # deployments, ALL_* dictionary views may be restricted or may not
-        # include current-user objects as expected; USER_* is the most reliable
-        # source in that scenario.
-        if requested_schema is None and not dblink:
-            rp_user = []
-
-            def _detect_user_constraints_rcol():
-                # Different YashanDB dictionary view variants may name the
-                # referenced-constraint column differently (e.g. R_CONSTRAINT_NAME
-                # vs R_CONS_NAME). Detect at runtime to avoid silent empty FKs.
-                cache_key = "_yashandb_user_constraints_rcol"
-                cached = getattr(self, cache_key, None)
-                if cached is not None:
-                    return cached
-                try:
-                    keys = connection.execute(
-                        sql.text("SELECT * FROM user_constraints WHERE 1=0")
-                    ).keys()
-                    keys_l = {k.lower() for k in keys}
-                except Exception:
-                    keys_l = set()
-                for cand in ("r_constraint_name", "r_cons_name"):
-                    if cand in keys_l:
-                        setattr(self, cache_key, cand)
-                        return cand
-                setattr(self, cache_key, None)
-                return None
-
-            rcol = _detect_user_constraints_rcol()
-            if rcol:
-                try:
-                    rp_user = connection.execute(
-                        sql.text(
-                            "SELECT "
-                            "uc.constraint_name, "
-                            "ucc.column_name AS local_column, "
-                            "rcon.table_name AS remote_table, "
-                            "rcc.column_name AS remote_column, "
-                            "NULL AS remote_owner, "
-                            "uc.delete_rule "
-                            "FROM user_constraints uc "
-                            "JOIN user_cons_columns ucc "
-                            "  ON uc.constraint_name = ucc.constraint_name "
-                            "JOIN user_constraints rcon "
-                            f"  ON uc.{rcol} = rcon.constraint_name "
-                            "JOIN user_cons_columns rcc "
-                            "  ON rcon.constraint_name = rcc.constraint_name "
-                            " AND ucc.position = rcc.position "
-                            "WHERE UPPER(uc.table_name) = UPPER(:table_name) "
-                            f"AND uc.{rcol} IS NOT NULL "
-                            "ORDER BY uc.constraint_name, ucc.position"
-                        ),
-                        {"table_name": table_name},
-                    ).fetchall()
-                except Exception:
-                    rp_user = []
-        else:
-            rp_user = []
-
-        params = {"table_name": table_name}
-        text = (
-            "SELECT "
-            "ac.constraint_name, "
-            "acc.column_name AS local_column, "
-            "rcon.table_name AS remote_table, "
-            "rcc.column_name AS remote_column, "
-            "rcon.owner AS remote_owner, "
-            "ac.delete_rule "
-            "FROM all_constraints%(dblink)s ac "
-            "JOIN all_cons_columns%(dblink)s acc "
-            "  ON ac.owner = acc.owner AND ac.constraint_name = acc.constraint_name "
-            "JOIN all_constraints%(dblink)s rcon "
-            "  ON ac.r_owner = rcon.owner AND ac.r_constraint_name = rcon.constraint_name "
-            "JOIN all_cons_columns%(dblink)s rcc "
-            "  ON rcon.owner = rcc.owner "
-            " AND rcon.constraint_name = rcc.constraint_name "
-            " AND acc.position = rcc.position "
-            "WHERE UPPER(ac.table_name) = UPPER(:table_name) "
-            "AND ac.r_constraint_name IS NOT NULL "
-        )
-
-        if schema is not None:
-            params["owner"] = schema
-            text += "AND ac.owner = CAST(:owner AS VARCHAR2(128)) "
-
-        text += "ORDER BY ac.constraint_name, acc.position"
-        text = text % {"dblink": dblink}
-        rp = connection.execute(sql.text(text), params).fetchall()
-
-        def fkey_rec():
-            return {
-                "name": None,
-                "constrained_columns": [],
-                "referred_schema": None,
-                "referred_table": None,
-                "referred_columns": [],
-                "options": {},
+    def _user_constraints_rcol(self, connection):
+        cache_key = "_yashandb_user_constraints_rcol"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached
+        try:
+            keys = {
+                key.lower()
+                for key in connection.execute(
+                    sql.text("SELECT * FROM user_constraints WHERE 1=0")
+                ).keys()
             }
+        except Exception:
+            keys = set()
+        for cand in ("r_constraint_name", "r_cons_name"):
+            if cand in keys:
+                setattr(self, cache_key, cand)
+                return cand
+        setattr(self, cache_key, None)
+        return None
 
-        fkeys = util.defaultdict(fkey_rec)
+    def _collect_reflect_names(
+        self, connection, kind, schema, filter_names, scope, **kw
+    ):
+        names_fns = []
+        temp_names_fns = []
+        if ObjectKind.TABLE in kind:
+            names_fns.append(self.get_table_names)
+            temp_names_fns.append(self.get_temp_table_names)
+        if ObjectKind.VIEW in kind:
+            names_fns.append(self.get_view_names)
+        if ObjectKind.MATERIALIZED_VIEW in kind:
+            if hasattr(self, "get_materialized_view_names"):
+                names_fns.append(self.get_materialized_view_names)
 
-        def _populate_from_rows(rows):
-            for (
-                cons_name,
-                local_col,
-                remote_table,
-                remote_col,
-                remote_owner,
-                delete_rule,
-            ) in rows:
-                cons_name = self.normalize_name(cons_name)
-                local_col = self.normalize_name(local_col)
-                remote_table_n = self.normalize_name(remote_table)
-                remote_col = self.normalize_name(remote_col)
-                remote_owner_n = self.normalize_name(remote_owner)
+        names = []
+        if (
+            filter_names
+            and scope is ObjectScope.ANY
+            and kind is ObjectKind.ANY
+        ):
+            names = list(filter_names)
+        else:
+            name_kw = {"schema": schema, **kw}
+            fns = []
+            if ObjectScope.DEFAULT in scope:
+                fns.extend(names_fns)
+            if ObjectScope.TEMPORARY in scope:
+                fns.extend(temp_names_fns)
 
-                rec = fkeys[cons_name]
-                rec["name"] = cons_name
-                # Dictionary view joins may return duplicate rows for the same
-                # FK/position depending on the deployment. Keep ordering stable
-                # but avoid duplicating column pairs.
-                existing_pairs = set(
-                    zip(rec["constrained_columns"], rec["referred_columns"])
-                )
-                if (local_col, remote_col) not in existing_pairs:
-                    rec["constrained_columns"].append(local_col)
-                    rec["referred_columns"].append(remote_col)
+            for fn in fns:
+                try:
+                    names.extend(fn(connection, **name_kw))
+                except NotImplementedError:
+                    pass
 
-                if not rec["referred_table"]:
-                    if resolve_synonyms:
-                        (
-                            ref_remote_name,
-                            ref_remote_owner,
-                            ref_dblink,
-                            ref_synonym,
-                        ) = self._resolve_synonym(
-                            connection,
-                            desired_owner=self.denormalize_name(remote_owner_n),
-                            desired_table=self.denormalize_name(remote_table_n),
-                        )
-                        if ref_synonym:
-                            remote_table_n = self.normalize_name(ref_synonym)
-                            remote_owner_n = self.normalize_name(ref_remote_owner)
+            if filter_names:
+                wanted = {self.normalize_name(name) for name in filter_names}
+                names = [name for name in names if name in wanted]
 
-                    rec["referred_table"] = remote_table_n
+        if (
+            filter_names
+            and scope is ObjectScope.ANY
+            and kind is ObjectKind.ANY
+        ):
+            names = [
+                name
+                for name in names
+                if self.has_table(connection, name, schema=schema, **kw)
+            ]
+        return names
 
-                    if (
-                        requested_schema is not None
-                        or self.denormalize_name(remote_owner_n) != schema
-                    ):
-                        rec["referred_schema"] = remote_owner_n
+    def _fetch_foreign_key_rows(self, connection, owner, table_names, dblink=""):
+        if not table_names:
+            return []
 
-                    if delete_rule and delete_rule != "NO ACTION":
-                        rec["options"]["ondelete"] = delete_rule
+        denorm_names = [self.denormalize_name(name) for name in table_names]
+        rows = []
+        chunk_size = 500
+        for offset in range(0, len(denorm_names), chunk_size):
+            chunk = denorm_names[offset : offset + chunk_size]
+            placeholders = ", ".join(f":t{i}" for i in range(len(chunk)))
+            params = {"owner": owner}
+            params.update({f"t{i}": name for i, name in enumerate(chunk)})
+            text = (
+                "SELECT ac.table_name, ac.constraint_name, "
+                "acc.column_name AS local_column, "
+                "rcon.table_name AS remote_table, "
+                "rcc.column_name AS remote_column, "
+                "rcon.owner AS remote_owner, ac.delete_rule "
+                "FROM all_constraints%(dblink)s ac "
+                "JOIN all_cons_columns%(dblink)s acc "
+                "  ON ac.owner = acc.owner "
+                " AND ac.constraint_name = acc.constraint_name "
+                "LEFT JOIN all_constraints%(dblink)s rcon "
+                "  ON ac.r_owner = rcon.owner "
+                " AND ac.r_constraint_name = rcon.constraint_name "
+                "LEFT JOIN all_cons_columns%(dblink)s rcc "
+                "  ON rcon.owner = rcc.owner "
+                " AND rcon.constraint_name = rcc.constraint_name "
+                " AND (rcc.position IS NULL OR acc.position = rcc.position) "
+                "WHERE ac.owner = CAST(:owner AS VARCHAR2(128)) "
+                "AND ac.constraint_type = 'R' "
+                "AND ac.r_constraint_name IS NOT NULL "
+                f"AND ac.table_name IN ({placeholders}) "
+                "ORDER BY ac.table_name, ac.constraint_name, acc.position"
+            ) % {"dblink": dblink}
+            rows.extend(connection.execute(sql.text(text), params).fetchall())
+        return rows
 
-        if rp_user:
-            _populate_from_rows(rp_user)
+    def _fetch_foreign_key_rows_user(self, connection, table_names):
+        rcol = self._user_constraints_rcol(connection)
+        if not rcol or not table_names:
+            return []
 
-        _populate_from_rows(rp)
-
-        if not fkeys:
-            # Fallback approach: fetch constraint + local/remote columns in
-            # separate steps. This is more compatible with some dictionary
-            # view variants and self-referential FKs.
-            cons_text = (
-                "SELECT constraint_name, r_owner, r_constraint_name, delete_rule "
-                "FROM all_constraints%(dblink)s "
-                "WHERE UPPER(table_name) = UPPER(:table_name) "
-                "AND r_constraint_name IS NOT NULL "
+        denorm_names = [self.denormalize_name(name) for name in table_names]
+        rows = []
+        chunk_size = 500
+        for offset in range(0, len(denorm_names), chunk_size):
+            chunk = denorm_names[offset : offset + chunk_size]
+            placeholders = ", ".join(f":t{i}" for i in range(len(chunk)))
+            params = {f"t{i}": name for i, name in enumerate(chunk)}
+            text = (
+                "SELECT uc.table_name, uc.constraint_name, "
+                "ucc.column_name AS local_column, "
+                "rcon.table_name AS remote_table, "
+                "rcc.column_name AS remote_column, "
+                "NULL AS remote_owner, uc.delete_rule "
+                "FROM user_constraints uc "
+                "JOIN user_cons_columns ucc "
+                "  ON uc.constraint_name = ucc.constraint_name "
+                "JOIN user_constraints rcon "
+                f"  ON uc.{rcol} = rcon.constraint_name "
+                "JOIN user_cons_columns rcc "
+                "  ON rcon.constraint_name = rcc.constraint_name "
+                " AND ucc.position = rcc.position "
+                "WHERE uc.constraint_type = 'R' "
+                f"AND uc.{rcol} IS NOT NULL "
+                f"AND uc.table_name IN ({placeholders}) "
+                "ORDER BY uc.table_name, uc.constraint_name, ucc.position"
             )
-            cons_params = {"table_name": table_name}
-            if schema is not None:
-                cons_text += "AND owner = CAST(:owner AS VARCHAR2(128)) "
-                cons_params["owner"] = schema
-
-            cons_text = cons_text % {"dblink": dblink}
-            cons_rows = connection.execute(sql.text(cons_text), cons_params).fetchall()
-            for cons_name, r_owner, r_cons_name, delete_rule in cons_rows:
-                local_cols = connection.execute(
-                    sql.text(
-                        "SELECT column_name FROM all_cons_columns%(dblink)s "
-                        "WHERE owner = :owner AND constraint_name = :cname "
-                        "ORDER BY position"
-                        % {"dblink": dblink}
-                    ),
-                    dict(owner=schema, cname=cons_name),
-                ).fetchall()
-                remote_cols = connection.execute(
-                    sql.text(
-                        "SELECT column_name FROM all_cons_columns%(dblink)s "
-                        "WHERE owner = :owner AND constraint_name = :cname "
-                        "ORDER BY position"
-                        % {"dblink": dblink}
-                    ),
-                    dict(owner=r_owner, cname=r_cons_name),
-                ).fetchall()
-                remote_table = connection.execute(
-                    sql.text(
-                        "SELECT table_name FROM all_constraints%(dblink)s "
-                        "WHERE owner = :owner AND constraint_name = :cname"
-                        % {"dblink": dblink}
-                    ),
-                    dict(owner=r_owner, cname=r_cons_name),
-                ).scalar()
-
-                rows = []
-                for (lc,), (rc,) in zip(local_cols, remote_cols):
-                    rows.append(
-                        (cons_name, lc, remote_table, rc, r_owner, delete_rule)
-                    )
-                _populate_from_rows(rows)
-
-        if not fkeys:
-            # Final fallback: use USER_* views (common when ALL_* is restricted)
             try:
-                cache_key = "_yashandb_user_constraints_rcol"
-                rcol = getattr(self, cache_key, None)
-                if rcol is None:
-                    try:
-                        keys = connection.execute(
-                            sql.text("SELECT * FROM user_constraints WHERE 1=0")
-                        ).keys()
-                        keys_l = {k.lower() for k in keys}
-                    except Exception:
-                        keys_l = set()
-                    for cand in ("r_constraint_name", "r_cons_name"):
-                        if cand in keys_l:
-                            rcol = cand
-                            break
-                    setattr(self, cache_key, rcol)
-
-                cons_rows = []
-                if rcol:
-                    cons_rows = connection.execute(
-                        sql.text(
-                            f"SELECT constraint_name, {rcol}, delete_rule "
-                            "FROM user_constraints "
-                            "WHERE UPPER(table_name) = UPPER(:table_name) "
-                            f"AND {rcol} IS NOT NULL"
-                        ),
-                        dict(table_name=table_name),
-                    ).fetchall()
-                for cons_name, r_cons_name, delete_rule in cons_rows:
-                    local_cols = connection.execute(
-                        sql.text(
-                            "SELECT column_name FROM user_cons_columns "
-                            "WHERE constraint_name = :cname ORDER BY position"
-                        ),
-                        dict(cname=cons_name),
-                    ).fetchall()
-                    remote_cols = connection.execute(
-                        sql.text(
-                            "SELECT column_name FROM user_cons_columns "
-                            "WHERE constraint_name = :cname ORDER BY position"
-                        ),
-                        dict(cname=r_cons_name),
-                    ).fetchall()
-                    remote_table = connection.execute(
-                        sql.text(
-                            "SELECT table_name FROM user_constraints "
-                            "WHERE constraint_name = :cname"
-                        ),
-                        dict(cname=r_cons_name),
-                    ).scalar()
-
-                    rows = []
-                    for (lc,), (rc,) in zip(local_cols, remote_cols):
-                        rows.append(
-                            (cons_name, lc, remote_table, rc, schema, delete_rule)
-                        )
-                    _populate_from_rows(rows)
+                rows.extend(connection.execute(sql.text(text), params).fetchall())
             except Exception:
                 pass
+        return rows
 
-        return list(fkeys.values())
+    def _foreign_keys_from_rows(self, rows, owner, requested_schema):
+        fkeys = util.defaultdict(dict)
+
+        for (
+            table_name,
+            cons_name,
+            local_col,
+            remote_table,
+            remote_col,
+            remote_owner,
+            delete_rule,
+        ) in rows:
+            table_key = self.normalize_name(table_name)
+            cons_name = self.normalize_name(cons_name)
+            local_col = self.normalize_name(local_col)
+            remote_table_n = self.normalize_name(remote_table) if remote_table else None
+            remote_col = self.normalize_name(remote_col) if remote_col else None
+            remote_owner_n = (
+                self.normalize_name(remote_owner) if remote_owner else None
+            )
+
+            if remote_table_n is None or remote_col is None:
+                continue
+
+            table_fkey = fkeys[table_key]
+            if cons_name not in table_fkey:
+                rec = {
+                    "name": cons_name,
+                    "constrained_columns": [],
+                    "referred_schema": None,
+                    "referred_table": remote_table_n,
+                    "referred_columns": [],
+                    "options": {},
+                }
+                if requested_schema is not None or (
+                    remote_owner_n
+                    and self.denormalize_name(remote_owner_n) != owner
+                ):
+                    rec["referred_schema"] = remote_owner_n
+                if delete_rule and delete_rule != "NO ACTION":
+                    rec["options"]["ondelete"] = delete_rule
+                table_fkey[cons_name] = rec
+            else:
+                rec = table_fkey[cons_name]
+
+            existing_pairs = set(
+                zip(rec["constrained_columns"], rec["referred_columns"])
+            )
+            if (local_col, remote_col) not in existing_pairs:
+                rec["constrained_columns"].append(local_col)
+                rec["referred_columns"].append(remote_col)
+
+        return fkeys
+
+    def get_multi_foreign_keys(
+        self,
+        connection,
+        *,
+        scope,
+        schema,
+        filter_names,
+        kind,
+        dblink=None,
+        **kw,
+    ):
+        dblink = dblink or ""
+        owner = self.denormalize_name(schema or self.default_schema_name)
+        all_objects = self._collect_reflect_names(
+            connection, kind, schema, filter_names, scope, dblink=dblink, **kw
+        )
+
+        rows = self._fetch_foreign_key_rows(
+            connection, owner, all_objects, dblink=dblink
+        )
+        if not rows and schema is None and not dblink:
+            rows = self._fetch_foreign_key_rows_user(connection, all_objects)
+
+        fkeys = self._foreign_keys_from_rows(rows, owner, schema)
+        default = ReflectionDefaults.foreign_keys
+
+        return (
+            (
+                (schema, self.normalize_name(obj_name)),
+                list(fkeys.get(self.normalize_name(obj_name), {}).values())
+                or default(),
+            )
+            for obj_name in all_objects
+        )
+
+    @reflection.cache
+    def get_foreign_keys(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_foreign_keys(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
 
     @reflection.cache
     def get_unique_constraints(self, connection, table_name, schema=None, **kw):
@@ -2119,6 +2385,9 @@ class YasDialect(default.DefaultDialect):
             resolve_synonyms,
             dblink,
             info_cache=info_cache,
+        )
+        self._raise_if_table_or_view_not_found(
+            connection, table_name, schema=schema, info_cache=info_cache
         )
 
         constraint_data = self._get_constraint_data(
@@ -2179,11 +2448,9 @@ class YasDialect(default.DefaultDialect):
 
         rp = connection.execute(sql.text(text), params).scalar()
         if rp:
-            if util.py2k:
-                rp = rp.decode(self.encoding)
             return rp
         else:
-            return None
+            raise exc.NoSuchTableError(view_name)
 
     @reflection.cache
     def get_check_constraints(

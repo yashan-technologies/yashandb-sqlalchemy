@@ -9,6 +9,36 @@ class Requirements(SuiteRequirements):
         return exclusions.open()
 
     @property
+    def reflect_table_options(self):
+        # Align with Oracle: reflect tablespace_name from ALL_TABLES.
+        return exclusions.open()
+
+    @property
+    def temp_table_reflection(self):
+        return exclusions.open()
+
+    @property
+    def temp_table_names(self):
+        return exclusions.open()
+
+    @property
+    def unique_constraints_reflect_as_index(self):
+        # YashanDB mirrors UNIQUE constraints with indexes in ALL_INDEXES.
+        return exclusions.open()
+
+    @property
+    def schemas(self):
+        # The SQLAlchemy suite requires a secondary user/schema named
+        # TEST_SCHEMA. The current test environment only provides MY_TEST001.
+        return exclusions.closed()
+
+    @property
+    def denormalized_names(self):
+        # Current YashanDB mode does not reliably preserve SQLAlchemy's
+        # quoted lowercase identifier round-trip expectations.
+        return exclusions.closed()
+
+    @property
     def implicitly_named_constraints(self):
         # The suite expects this attribute to exist. YashanDB supports
         # server-side generated constraint names when a name isn't given.
@@ -40,9 +70,15 @@ class Requirements(SuiteRequirements):
 
     @property
     def sane_rowcount_w_returning(self):
-        # YashanDB (in current tested mode) does not support
-        # UPDATE .. RETURNING .. INTO, so rowcount tests that rely on RETURNING
-        # must be skipped.
+        # Kernel supports single-row RETURNING only; multi-row UPDATE
+        # RETURNING is not available (YAS-05205).
+        return exclusions.closed()
+
+    @property
+    def float_is_numeric(self):
+        # The dialect adapts SQLAlchemy Float/Double through the YashanDB
+        # numeric implementation, so the suite assertion that Float and
+        # Numeric have distinct dialect impl identities does not apply.
         return exclusions.closed()
 
     @property
