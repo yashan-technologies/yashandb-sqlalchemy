@@ -8,12 +8,11 @@
 # - Python: 3.11.x
 # - SQLAlchemy: 2.0.50
 # - pytest: 7.x or newer
-# - YashanDB Python DBAPI: yaspy==1.2.1 (required for DB-backed tests)
+# - YashanDB Python DBAPI: yaspy>=1.2.1 (required for DB-backed tests)
 #
 # yaspy:
-#   Pinned to 1.2.1 to match README-USER-GUIDE.md and tested behavior
-#   (BLOB NUL round-trip, RETURNING, etc.). If using a private index,
-#   pass -i/--extra-index-url or set pip.conf.
+#   Minimum 1.2.1 (BLOB NUL round-trip fix); matches README-USER-GUIDE.md.
+#   If using a private index, pass -i/--extra-index-url or set pip.conf.
 #
 # Install:
 #   pip install -r requirements_dev.txt
@@ -21,5 +20,5 @@
 
 SQLAlchemy==2.0.50
 pytest>=7.0.0,<10
-yaspy==1.2.1
+yaspy>=1.2.1
 

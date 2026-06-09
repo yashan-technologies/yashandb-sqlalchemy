@@ -13,9 +13,9 @@
 | Python | 建议 **3.11.x** |
 | SQLAlchemy | **2.0.50**（本分支面向 SQLAlchemy 2.0.50 方言接口适配） |
 | 数据库 | 建议 **YashanDB 23.4.x.x**|
-| Python 驱动 | 建议 **yaspy 1.2.1** |
+| Python 驱动 | 建议 **yaspy >= 1.2.1** |
 
-> **驱动安装**：`yaspy` 已可通过 PyPI 安装（`pip install yaspy==1.2.1`）。本仓库 `setup.py` 已声明 SQLAlchemy 运行时依赖；`yaspy` 仍需运行应用前自行安装。开发/跑连库测试时，执行 `pip install -r requirements_dev.txt` 会安装 **`yaspy==1.2.1`**，与上表建议版本一致。
+> **驱动安装**：`yaspy` 已可通过 PyPI 安装（`pip install "yaspy>=1.2.1"`）。本仓库 `setup.py` 已声明 SQLAlchemy 运行时依赖；`yaspy` 仍需运行应用前自行安装。开发/跑连库测试时，执行 `pip install -r requirements_dev.txt` 会安装 **`yaspy>=1.2.1`** 的可用版本，与上表最低版本要求一致。
 
 ---
 
@@ -24,7 +24,7 @@
 ### 2.1 运行时依赖
 
 - **SQLAlchemy 2.0.50**：ORM/Core 与方言接口所依赖。
-- **与数据库通信的 DBAPI 驱动**（`yaspy==1.2.1`）：运行应用时需自行安装；`requirements_dev.txt` 中已固定该版本，便于测试环境一键安装。
+- **与数据库通信的 DBAPI 驱动**（`yaspy>=1.2.1`）：运行应用时需自行安装；`requirements_dev.txt` 已声明最低版本，便于测试环境一键安装。
 
 本仓库包名：`yashandb-sqlalchemy`（见 `setup.py` 中 `name`）。
 
@@ -36,7 +36,7 @@
 pip install -r requirements_dev.txt
 ```
 
-其中包含 `SQLAlchemy==2.0.50`、`pytest>=7.0.0,<10`、`yaspy==1.2.1` 等（详见 `requirements_dev.txt`）。
+其中包含 `SQLAlchemy==2.0.50`、`pytest>=7.0.0,<10`、`yaspy>=1.2.1` 等（详见 `requirements_dev.txt`）。
 
 ---
 
