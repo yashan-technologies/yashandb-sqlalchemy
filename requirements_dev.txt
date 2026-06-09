@@ -5,17 +5,15 @@
 # SQLAlchemy dialect testing suite (pytest plugin).
 #
 # Recommended environment:
-# - Python: 3.9.x
+# - Python: 3.11.x
 # - SQLAlchemy: 2.0.50
 # - pytest: 7.x or newer
-# - YashanDB Python DBAPI: yaspy (listed below; required for DB-backed tests)
+# - YashanDB Python DBAPI: yaspy==1.2.1 (required for DB-backed tests)
 #
 # yaspy:
-#   Published on PyPI (or your team index). Listed without a version pin so
-#   `pip install -r requirements_dev.txt` installs the latest compatible release
-#   from the configured index. For bit-for-bit reproducible CI, pin explicitly, e.g.:
-#     yaspy==1.2.3
-#   If using a private index, pass -i/--extra-index-url or set pip.conf.
+#   Pinned to 1.2.1 to match README-USER-GUIDE.md and tested behavior
+#   (BLOB NUL round-trip, RETURNING, etc.). If using a private index,
+#   pass -i/--extra-index-url or set pip.conf.
 #
 # Install:
 #   pip install -r requirements_dev.txt
@@ -23,5 +21,5 @@
 
 SQLAlchemy==2.0.50
 pytest>=7.0.0,<10
-yaspy
+yaspy==1.2.1
 
